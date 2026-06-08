@@ -2,14 +2,38 @@ const { chromium } = require("playwright");
 const fs = require("fs");
 const path = require("path");
 
-async function run() {
-  const botToken = process.env.DISCORD_BOT_TOKEN;
-  if (!botToken) throw new Error("DISCORD_BOT_TOKEN not set");
+const D1_URL = `https://api.cloudflare.com/client/v4/accounts/${process.env.CF_ACCOUNT_ID}/d1/database/${process.env.CF_D1_DATABASE_ID}/query`;
 
+async function d1(sql, params = []) {
+  const res = await fetch(D1_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.CF_API_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ sql, params }),
+  });
+  const json = await res.json();
+  if (!json.success) throw new Error(`D1 error: ${JSON.stringify(json.errors)}`);
+  return json.result[0].results;
+}
+
+async function run() {
+  const botToken = process.env.DISCORD_TOKEN;
+  if (!botToken) throw new Error("DISCORD_TOKEN not set");
+
+  let channelIds;
   const channelIdsRaw = process.env.CHANNEL_IDS;
-  if (!channelIdsRaw) throw new Error("CHANNEL_IDS not set");
-  const channelIds = channelIdsRaw.split(",").map((s) => s.trim()).filter(Boolean);
-  if (channelIds.length === 0) throw new Error("No channel IDs provided");
+  if (channelIdsRaw) {
+    channelIds = channelIdsRaw.split(",").map((s) => s.trim()).filter(Boolean);
+  } else {
+    const rows = await d1("SELECT channel_id FROM screenshot_channels");
+    channelIds = rows.map((r) => r.channel_id);
+  }
+  if (channelIds.length === 0) {
+    console.log("No channels subscribed, skipping.");
+    return;
+  }
 
   const browser = await chromium.launch();
   const context = await browser.newContext({
