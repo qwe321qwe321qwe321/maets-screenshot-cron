@@ -104,7 +104,8 @@ async function takeScreenshot(proxy, slug, cc, locale = "en-US", knownIpLabel = 
   const page = await context.newPage();
   const params = new URLSearchParams();
   if (cc) params.set("cc", cc);
-  if (locale !== "en-US") params.set("l", locale.split("-")[0] === "ja" ? "japanese" : locale.split("-")[0]);
+  const localeToSteamLang = { "ja-JP": "japanese", "zh-CN": "schinese", "zh-TW": "tchinese" };
+  if (locale !== "en-US") params.set("l", localeToSteamLang[locale] ?? locale.split("-")[0]);
   const query = params.toString();
   const url = `https://store.steampowered.com/${query ? `?${query}` : ""}`;
 
@@ -297,7 +298,8 @@ async function run() {
     for (const proxy of verifiedProxies) {
       console.log(`Trying ${proxy.server} for Steam screenshot...`);
       try {
-        result = await takeScreenshot(proxy, slug, freeProxyCountry.toLowerCase(), "en-US", proxy.ipLabel, unixTs, { waitUntil: "load", timeout: 90000 });
+        const freeLocale = freeProxyCountry === "CN" ? "zh-CN" : freeProxyCountry === "TW" ? "zh-TW" : "en-US";
+        result = await takeScreenshot(proxy, slug, freeProxyCountry.toLowerCase(), freeLocale, proxy.ipLabel, unixTs, { waitUntil: "load", timeout: 90000 });
         break;
       } catch (e) {
         console.log(`Screenshot failed with ${proxy.server}: ${e.message}`);
