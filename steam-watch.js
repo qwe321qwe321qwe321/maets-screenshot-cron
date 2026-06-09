@@ -52,7 +52,8 @@ function generateSessionId() {
 	return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function fetchSteamFollowers(appid, sessionid) {
+async function fetchSteamFollowers(appid, retries = 1) {
+	const sessionid = generateSessionId();
 	const res = await fetch(
 		`https://steamcommunity.com/search/SearchCommunityAjax?text=${appid}&filter=groups&sessionid=${sessionid}&steamid_user=false`,
 		{
@@ -63,12 +64,33 @@ async function fetchSteamFollowers(appid, sessionid) {
 			},
 		}
 	);
-	if (!res.ok) return null;
+	if (res.status === 429) {
+		if (retries <= 0) {
+			console.error(`[followers][${appid}] 429, no retries left`);
+			return null;
+		}
+		console.warn(`[followers][${appid}] 429, waiting 5s before retry`);
+		await new Promise(r => setTimeout(r, 5000));
+		return fetchSteamFollowers(appid, retries - 1);
+	}
+	if (!res.ok) {
+		console.error(`[followers][${appid}] HTTP ${res.status}`);
+		return null;
+	}
 	const json = await res.json();
-	if (json.success !== 1 || !json.html) return null;
-	if (!json.html.includes(`/app/${appid}`)) return null;
+	if (json.success !== 1 || !json.html) {
+		console.error(`[followers][${appid}] success=${json.success} html=${json.html ? json.html.slice(0, 200) : '(empty)'}`);
+		return null;
+	}
+	if (!json.html.includes(`/app/${appid}`)) {
+		console.error(`[followers][${appid}] /app/${appid} not found — first 300 chars: ${json.html.slice(0, 300)}`);
+		return null;
+	}
 	const match = json.html.match(/<span[^>]*>([\d,]+)<\/span>\s*members in this group/);
-	if (!match) return null;
+	if (!match) {
+		console.error(`[followers][${appid}] regex no match — snippet: ${json.html.slice(0, 300)}`);
+		return null;
+	}
 	return parseInt(match[1].replace(/,/g, ''), 10);
 }
 
@@ -166,19 +188,17 @@ async function runDailyReport(filterChannelId = '') {
 	if (tracked.length === 0) return;
 
 	const uniqueAppIds = [...new Set(tracked.map(r => r.appid))];
-	const sessionid = generateSessionId();
 	const wishlistRanks = await fetchWishlistRanks();
 
 	const dataMap = new Map();
 
-	for (const appid of uniqueAppIds) {
+	// Phase 1 (parallel): reviews + DB reads
+	const baseData = await Promise.all(uniqueAppIds.map(async appid => {
 		const cachedEntry = tracked.find(r => r.appid === appid);
 		const comingSoon = Boolean(cachedEntry?.coming_soon);
 		const releaseDate = cachedEntry?.release_date ?? null;
-
-		const [reviews, followers, prev, prev7d, followerHistoryRows] = await Promise.all([
+		const [reviews, prev, prev7d, followerHistoryRows] = await Promise.all([
 			fetchSteamReviews(appid),
-			comingSoon ? fetchSteamFollowers(appid, sessionid) : Promise.resolve(null),
 			d1(
 				"SELECT followers, reviews_total, review_score, wishlist_rank FROM snapshots WHERE appid = ? AND strftime('%Y-%m-%d', checked_at) < strftime('%Y-%m-%d', 'now') ORDER BY checked_at DESC LIMIT 1",
 				[appid]
@@ -194,7 +214,25 @@ async function runDailyReport(filterChannelId = '') {
 				)
 				: Promise.resolve([]),
 		]);
+		return { appid, comingSoon, releaseDate, reviews, prev, prev7d, followerHistoryRows };
+	}));
 
+	// Phase 2 (sequential with delay): follower fetches one at a time to avoid Steam rate limiting
+	const followerMap = new Map();
+	let firstFollower = true;
+	for (const { appid, comingSoon } of baseData) {
+		if (comingSoon) {
+			if (!firstFollower) await new Promise(r => setTimeout(r, 1000));
+			firstFollower = false;
+			followerMap.set(appid, await fetchSteamFollowers(appid));
+		} else {
+			followerMap.set(appid, null);
+		}
+	}
+
+	// Phase 3: write snapshots + populate dataMap
+	for (const { appid, comingSoon, releaseDate, reviews, prev, prev7d, followerHistoryRows } of baseData) {
+		const followers = followerMap.get(appid) ?? null;
 		const reviewScore = reviews && reviews.total > 0
 			? Math.round((reviews.positive / reviews.total) * 100)
 			: null;
