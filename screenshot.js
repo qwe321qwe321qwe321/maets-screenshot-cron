@@ -201,68 +201,71 @@ async function takeScreenshot(proxy, slug, cc, locale = "en-US", knownIpLabel = 
   return { screenshotPath, htmlPath, tabData, ipLabel };
 }
 
-async function postToChannel(channelId, botToken, screenshotPath, htmlPath, tabData, label, unixTs, isoDate, showButton) {
-  const tabLabels = [
-    { key: "popularNewReleases", label: "Popular New Releases" },
-    { key: "topSellers", label: "Top Sellers" },
-    { key: "popularUpcoming", label: "Popular Upcoming" },
-    { key: "specials", label: "Specials" },
-    { key: "trendingFree", label: "Trending Free" },
-  ];
-  const lines = [];
-  for (const { key, label: tabLabel } of tabLabels) {
-    lines.push(tabLabel);
+const TAB_KEYS = [
+  { key: "popularNewReleases", label: "Popular New Releases" },
+  { key: "topSellers", label: "Top Sellers" },
+  { key: "popularUpcoming", label: "Popular Upcoming" },
+  { key: "specials", label: "Specials" },
+  { key: "trendingFree", label: "Trending Free" },
+];
+
+const CAPTURE_NOW_BUTTON = {
+  type: 1,
+  components: [{ type: 2, style: 1, custom_id: "capture_now", emoji: { name: "📸" }, label: "Capture Now" }],
+};
+
+function buildTabBlock(label, tabData) {
+  const lines = [label];
+  for (const { key, label: tabLabel } of TAB_KEYS) {
+    lines.push(`  ${tabLabel}`);
     const items = tabData[key];
     if (items.length === 0) {
-      lines.push("  (no data)");
+      lines.push("    (no data)");
     } else {
-      items.forEach((item, i) => {
-        lines.push(`  ${String(i + 1).padStart(2)}. ${item.name} (${item.appId})`);
-      });
+      items.forEach((item, i) => lines.push(`    ${String(i + 1).padStart(2)}. ${item.name} (${item.appId})`));
     }
-    lines.push("");
   }
-  const codeBlock = "```\n" + lines.join("\n").trimEnd() + "\n```";
+  return lines.join("\n");
+}
 
-  const CAPTURE_NOW_BUTTON = {
-    type: 1,
-    components: [{
-      type: 2,
-      style: 1,
-      custom_id: "capture_now",
-      emoji: { name: "📸" },
-      label: "Capture Now",
-    }],
-  };
-
-  const imageBuffer = fs.readFileSync(screenshotPath);
-  const htmlBuffer = fs.readFileSync(htmlPath);
-  const htmlFilename = path.basename(htmlPath);
+async function postAllToChannel(channelId, botToken, regions, unixTs, isoDate) {
+  // regions: [{ label, screenshotPath, htmlPath, tabData }] or [{ label, error }] for failed ones
   const formData = new FormData();
-  formData.append("files[0]", new Blob([imageBuffer], { type: "image/png" }), "steam_homepage.png");
-  formData.append("files[1]", new Blob([htmlBuffer], { type: "text/html" }), htmlFilename);
-  formData.append(
-    "payload_json",
-    JSON.stringify({ content: `${label} · ${isoDate}\n<t:${unixTs}:F>`, flags: 4 })
-  );
+  let fileIdx = 0;
+  const labelLines = [];
+
+  for (const r of regions) {
+    labelLines.push(r.error ? `${r.label} ⚠️ 截圖失敗` : r.label);
+    if (!r.error) {
+      formData.append(`files[${fileIdx++}]`, new Blob([fs.readFileSync(r.screenshotPath)], { type: "image/png" }), `${r.slug}.png`);
+      formData.append(`files[${fileIdx++}]`, new Blob([fs.readFileSync(r.htmlPath)], { type: "text/html" }), path.basename(r.htmlPath));
+    }
+  }
+
+  formData.append("payload_json", JSON.stringify({
+    content: `${labelLines.join(" · ")}\n${isoDate} · <t:${unixTs}:F>`,
+    flags: 4,
+  }));
+
   const imgRes = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
     method: "POST",
     headers: { Authorization: `Bot ${botToken}` },
     body: formData,
   });
   if (!imgRes.ok) {
-    console.error(`Image post failed for ${channelId}: ${imgRes.status} ${await imgRes.text()}`);
+    console.error(`Screenshot post failed for ${channelId}: ${imgRes.status} ${await imgRes.text()}`);
     return;
   }
+
+  const allTabLines = regions.map((r) =>
+    r.error ? `${r.label}\n  ⚠️ 截圖失敗: ${r.error.message}` : buildTabBlock(r.label, r.tabData)
+  );
+  const codeBlock = "```\n" + allTabLines.join("\n\n") + "\n```";
 
   const tabRes = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
     method: "POST",
     headers: { Authorization: `Bot ${botToken}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      content: codeBlock,
-      flags: 4,
-      ...(showButton ? { components: [CAPTURE_NOW_BUTTON] } : {}),
-    }),
+    body: JSON.stringify({ content: codeBlock, flags: 4, components: [CAPTURE_NOW_BUTTON] }),
   });
   if (!tabRes.ok) {
     console.error(`Tab post failed for ${channelId}: ${tabRes.status} ${await tabRes.text()}`);
@@ -289,62 +292,49 @@ async function run() {
   const unixTs = Math.floor(Date.now() / 1000);
   const isoDate = new Date().toISOString();
 
-  const freeProxyMode = process.env.FREE_PROXY_MODE === "true";
-  const freeProxyCountry = (process.env.FREE_PROXY_COUNTRY || "CN").toUpperCase();
+  console.log("Taking all screenshots in parallel...");
+  const [defaultResult, gbResult, jpResult, cnOutcome] = await Promise.all([
+    takeScreenshot(null, "default", null, "en-US", null, unixTs),
+    fetchProxyByCountry("GB").then((p) => takeScreenshot(p, "gb", "gb", "en-GB", p.ipLabel, unixTs)),
+    fetchProxyByCountry("JP").then((p) => takeScreenshot(p, "japan", "jp", "ja-JP", p.ipLabel, unixTs)),
+    findWorkingFreeProxy("CN")
+      .then(async (proxies) => {
+        for (const proxy of proxies) {
+          console.log(`Trying ${proxy.server} for CN screenshot...`);
+          try {
+            return await takeScreenshot(proxy, "cn", "cn", "zh-CN", proxy.ipLabel, unixTs, { waitUntil: "domcontentloaded", waitForContent: true, timeout: 90000 });
+          } catch (e) {
+            console.log(`CN screenshot failed with ${proxy.server}: ${e.message}`);
+          }
+        }
+        throw new Error("All verified CN proxies failed to load Steam");
+      })
+      .catch((e) => ({ error: e })),
+  ]);
 
-  if (freeProxyMode) {
-    console.log(`Fetching free ${freeProxyCountry} proxies from proxyscrape...`);
-    const verifiedProxies = await findWorkingFreeProxy(freeProxyCountry);
-    const slug = freeProxyCountry.toLowerCase();
-    const cc = freeProxyCountry;
-    const flag = cc.split("").map((c) => String.fromCodePoint(0x1f1e6 + c.charCodeAt(0) - 65)).join("");
-    let result = null;
-    for (const proxy of verifiedProxies) {
-      console.log(`Trying ${proxy.server} for Steam screenshot...`);
-      try {
-        const freeLocale = freeProxyCountry === "CN" ? "zh-CN" : freeProxyCountry === "TW" ? "zh-TW" : "en-US";
-        result = await takeScreenshot(proxy, slug, freeProxyCountry.toLowerCase(), freeLocale, proxy.ipLabel, unixTs, { waitUntil: "domcontentloaded", waitForContent: true, timeout: 90000 });
-        break;
-      } catch (e) {
-        console.log(`Screenshot failed with ${proxy.server}: ${e.message}`);
-      }
-    }
-    if (!result) throw new Error(`All verified ${cc} proxies failed to load Steam`);
-    for (const channelId of channelIds) {
-      await postToChannel(channelId, botToken, result.screenshotPath, result.htmlPath, result.tabData,
-        `${flag} Steam homepage · ${cc} (proxyscrape) · \`${result.ipLabel}\``, unixTs, isoDate, true);
-    }
-    fs.unlinkSync(result.screenshotPath);
-    fs.unlinkSync(result.htmlPath);
-    console.log("Done:", new Date().toISOString());
-    return;
-  }
+  const cnResult = cnOutcome?.error ? null : cnOutcome;
+  const cnError = cnOutcome?.error ?? null;
+  if (cnError) console.error(`CN failed: ${cnError.message}`);
 
-  console.log("Taking default screenshot...");
-  const { screenshotPath: defaultPath, htmlPath: defaultHtml, tabData: defaultTabs, ipLabel: defaultIp } = await takeScreenshot(null, "default", null, "en-US", null, unixTs);
-
-  console.log("Fetching GB proxy...");
-  const gbProxy = await fetchProxyByCountry("GB");
-  console.log("Taking GB screenshot...");
-  const { screenshotPath: gbPath, htmlPath: gbHtml, tabData: gbTabs, ipLabel: gbIp } = await takeScreenshot(gbProxy, "gb", "gb", "en-GB", gbProxy.ipLabel, unixTs);
-
-  console.log("Fetching JP proxy...");
-  const jpProxy = await fetchProxyByCountry("JP");
-  console.log("Taking JP screenshot...");
-  const { screenshotPath: jpPath, htmlPath: jpHtml, tabData: jpTabs, ipLabel: jpIp } = await takeScreenshot(jpProxy, "japan", "jp", "ja-JP", jpProxy.ipLabel, unixTs);
+  const regions = [
+    { slug: "default", label: `🌐 Default · \`${defaultResult.ipLabel}\``, ...defaultResult },
+    { slug: "gb",      label: `🇬🇧 UK · \`${gbResult.ipLabel}\``,         ...gbResult },
+    { slug: "japan",   label: `🇯🇵 Japan · \`${jpResult.ipLabel}\``,      ...jpResult },
+    cnResult
+      ? { slug: "cn", label: `🇨🇳 CN · \`${cnResult.ipLabel}\``, ...cnResult }
+      : { slug: "cn", label: "🇨🇳 CN", error: cnError },
+  ];
 
   for (const channelId of channelIds) {
-    await postToChannel(channelId, botToken, defaultPath, defaultHtml, defaultTabs, `🌐 Steam homepage · Default · \`${defaultIp}\``, unixTs, isoDate, false);
-    await postToChannel(channelId, botToken, gbPath, gbHtml, gbTabs, `🇬🇧 Steam homepage · UK · \`${gbIp}\``, unixTs, isoDate, false);
-    await postToChannel(channelId, botToken, jpPath, jpHtml, jpTabs, `🇯🇵 Steam homepage · Japan · \`${jpIp}\``, unixTs, isoDate, true);
+    await postAllToChannel(channelId, botToken, regions, unixTs, isoDate);
   }
 
-  fs.unlinkSync(defaultPath);
-  fs.unlinkSync(defaultHtml);
-  fs.unlinkSync(gbPath);
-  fs.unlinkSync(gbHtml);
-  fs.unlinkSync(jpPath);
-  fs.unlinkSync(jpHtml);
+  for (const r of regions) {
+    if (!r.error) {
+      fs.unlinkSync(r.screenshotPath);
+      fs.unlinkSync(r.htmlPath);
+    }
+  }
   console.log("Done:", new Date().toISOString());
 }
 
